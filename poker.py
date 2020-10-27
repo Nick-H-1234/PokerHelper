@@ -6,6 +6,7 @@ class Player:
         self.name = name.capitalize()
         self.stack = stack
         self.current_bet = 0
+        self.hand_total_invested = 0
         self.folded = False
         self.all_in = False
         self.last_bettor = False
@@ -17,11 +18,22 @@ class Player:
     def __str__(self):
         return "%s : %s" % (self.name, self.stack)
 
+    # TODO make a "make bet" method for DRY reasons
+    def make_bet(self, bet_total):
+        pass
+
 
 class Pot:
     def __init__(self, players, value):
-        self.players = players
+        self.players = players.copy()
         self.value = value
+
+    def __str__(self):
+        return "Players: %s \n Value: %s" % (self.players, self.value)
+
+
+def get_next_player(players, player, postions_number=1):
+    return players[(players.index(player) + postions_number) % len(players)]
 
 
 def check_win(players):
@@ -65,55 +77,69 @@ def reset_players(players):
         player.big_blind_acted = False
         player.big_blind_checked = False
         player.first_action = False
+        player.current_bet = 0
+        player.hand_total_invested = 0
+
+
+def skip_to_showdown(players):
+    count = 0
+    for player in players:
+        if player.folded or player.all_in:
+            count += 1
+    return count >= len(players) - 1
 
 
 def play_hand(hand_players, big_blind, dealer):
     print("Starting a hand. Deal your cards now")
     # preflop
-    pot = play_round(hand_players, dealer, 0, big_blind, preflop=True)
-    if pot == 0:
+    main_pot = Pot(hand_players, 0)
+    pots = [main_pot]
+    pots = play_round(hand_players, dealer, pots, big_blind, preflop=True)
+    if pots[0].value == 0:
         return
     print("Preflop round is over! Please deal the flop.")
 
     # flop
-    pot = play_round(hand_players, dealer, pot)
-    if pot == 0:
+    pots = play_round(hand_players, dealer, pots)
+    if pots[0].value == 0:
         return
     print("Flop round is over! Please deal the turn.")
 
     # turn
-    pot = play_round(hand_players, dealer, pot)
-    if pot == 0:
+    pots = play_round(hand_players, dealer, pots)
+    if pots[0].value == 0:
         return
     print("Turn round is over! Please deal the river.")
 
     # river
-    play_round(hand_players, dealer, pot, river=True)
+    play_round(hand_players, dealer, pots, river=True)
     return
 
 
-def play_round(players, dealer, pot, bet=0, river=False, preflop=False):
+def play_round(players, dealer, pots, bet=0, river=False, preflop=False):
     min_bet = 2 * bet
     playing_round = True
     # if pre-flop, post blinds and player left of big blind acts
     if preflop:
-        current_player = players[(players.index(dealer) + 3) % len(players)]
-        players[(players.index(dealer) + 2) % len(players)].big_blind = True
+        current_player = get_next_player(players, dealer, 3)
         # post small blind
-        small_blind = players[(players.index(dealer) + 1) % len(players)]
+        small_blind = get_next_player(players, dealer)
         small_blind.current_bet = 0.5 * bet
         small_blind.stack -= 0.5 * bet
+        small_blind.hand_total_invested += 0.5 * bet
         print("%s posts a small blind of %s" % (small_blind.name, bet*0.5))
         # post big blind
-        big_blind = players[(players.index(dealer) + 2) % len(players)]
+        big_blind = get_next_player(players, dealer, 2)
+        big_blind.big_blind = True
         big_blind.last_bettor = True
         big_blind.current_bet = bet
         big_blind.stack -= bet
+        big_blind.hand_total_invested += bet
         print("%s posts a big blind of %s" % (big_blind.name, bet))
 
     # else, player left of dealer acts first
     else:
-        current_player = players[(players.index(dealer) + 1) % len(players)]
+        current_player = get_next_player(players, dealer)
         current_player.first_action = True
 
     # handle betting round
@@ -135,60 +161,119 @@ def play_round(players, dealer, pot, bet=0, river=False, preflop=False):
 
         # skip folded or all-in players
         if current_player.all_in or current_player.folded:
-            current_player = players[(players.index(current_player) + 1) % len(players)]
+            current_player = get_next_player(players, current_player)
             continue
 
         # once checks are done, take player's action then move to the next player
-        bet, min_bet = get_player_action(bet, min_bet, pot, players, current_player)
+        bet, min_bet = get_player_action(bet, min_bet, pots, players, current_player)
 
         # if player was first to act in post-flop round, then treat them as last bettor anyway if they check
         if current_player.first_action and not current_player.folded:
             current_player.last_bettor = True
         # else if they open fold, treat the next player along as 'first action'
         elif current_player.first_action and current_player.folded:
-            players[(players.index(current_player) + 1) % len(players)].first_action = True
+            get_next_player(players, current_player).first_action = True
 
         # if it was just the Big Blind's 1st action and they checked, end betting round
         if current_player.last_bettor and current_player.big_blind and current_player.big_blind_checked:
             playing_round = False
             break
-        current_player = players[(players.index(current_player) + 1) % len(players)]
+        current_player = get_next_player(players, current_player)
 
-    # after betting round, collect bets into pot and clean up
-    for player in players:
-        pot += player.current_bet
-        player.current_bet = 0
-        player.last_bettor = False
-        player.big_blind_checked = False
-        player.big_blind_acted = False
+    # after betting round, manage side pots fist
+    # If someone is all in, there's a potential for a side pot to be created
+    all_in_players = [player for player in players if player.all_in]
+    unique_all_in_amounts = list(set([p.hand_total_invested for p in all_in_players]))
+    unique_all_in_amounts.sort()
+    if len(all_in_players):
+        # if there are any players who have invested more than the lowest all-in player, we need a side pot
+        # (the all-in player's bet goes in main pot with everyone else's)
+        # for each player or players who are all-in for x amount, with total bet higher, new side pot is needed
+        for i in unique_all_in_amounts:
+            eligible_players = [player for player in players if player.hand_total_invested > i]
+            eligible_player_investments = [x.hand_total_invested for x in eligible_players]
+            if len(eligible_players) > 1:
+                # if multiple players, make a side pot
+                pots.append(Pot(eligible_players, ((min(eligible_player_investments) -
+                                                    i) * len(eligible_players))))
+            if len(eligible_players) == 1:
+                # if only 1 player in a potential side pot, just refund him his chips over the last (lower) all in
+                eligible_players[0].stack += (eligible_player_investments[0] - i)
 
-    print("Betting round is over. The pot is %s" % pot)
+        # check for folded players and make them unable to win any pots
+        for player in players:
+            if player.folded:
+                for pot in pots:
+                    if player in pot.players:
+                        pot.players.remove(player)
 
-    # if only 1 player left, they win
-    if check_win(players):
-        winner = get_winner_by_folding(players)
-        winner.stack += pot
-        pot = 0
+        # if a side pot only has 1 player eligible for it (i.e. all others folded) then that player wins that pot
+        for i in range(len(pots)):
+            if len(pots[i].players) == 1:
+                pots[i].players[0].stack += pots[i].value
+                pots.remove(pots[i])
 
-    # deal with winner at showdown
+        # collect all bets of value equal to the minimum all-in into main pot and set "current bet" to 0 for everyone
+        # unless they folded for less, in which case add as much as they bet
+        for player in players:
+            pots[0].value += min([min(unique_all_in_amounts), player.current_bet])
+            player.current_bet = 0
+
+    else:
+        # no all-ins, just put all bets in main pot and continue
+        for player in players:
+            pots[0].value += player.current_bet
+            player.current_bet = 0
+            player.last_bettor = False
+            player.big_blind_checked = False
+            player.big_blind_acted = False
+
+    print("Betting round is over. The main pot is %s" % pots[0].value)
+    if len(pots) > 1:
+        print("Side pot standings are: ")
+        for i in range(1, len(pots)):
+            print("Side pot %s: " % i, pots[i])
+
+    # if only 1 player left in a pot, they win that pot
+    for pot in pots:
+        if check_win(pot.players):
+            winner = get_winner_by_folding(pot.players)
+            winner.stack += pot.value
+            pot.value = 0
+
+    # deal with winner at showdown if there's just the main pot
+    # if river and len(pots) == 1:
+    #     winner = get_winner_by_showdown(players)
+    #     winner.stack += pots[0].value
+    #     pots[0].value = 0
+
+    # if we have side pots at the showdown, handle them here
     if river:
-        winner = get_winner_by_showdown(players)
-        winner.stack += pot
-        pot = 0
+        for i in range(len(pots)):
+            print("Dealing with %s" % ("the main pot" if i == 0 else "side pot %s" % (str(i-1))))
+            winner = get_winner_by_showdown(pots[i].players)
+            winner.stack += pots[i].value
+            pots[i].value = 0
+    return pots
 
-    return pot
 
-
-def get_player_action(bet, min_bet, pot, players, current_player):
+def get_player_action(bet, min_bet, pots, players, current_player):
     valid_response = False
+    side_pot_values = 0
+    for i in range(1, len(pots)):
+        side_pot_values += pots[i].value
     while not valid_response:
         response = input("\n%s, it's your turn to bet. \n"
-                         "There is %s in the pot, and %s chips have been bet by other players \n"
+                         "There is %s in the main pot, and %s \n"
+                         "%s chips have been bet by other players \n"
                          "Current bet is %s, and you have bet %s so far this round. \n"
                          "You have %s chips left in your stack. \n"
                          "Would you like to (R)aise, %s, (F)old, or go (A)ll-in?\n" %
-                         (current_player.name, "nothing" if pot == 0 else pot, get_current_bets(players), bet,
-                          current_player.current_bet, current_player.stack,
+                         (current_player.name,
+                          "nothing" if pots[0].value == 0 else pots[0].value,
+                          "there are no side pots" if len(pots) == 1 else "the side pots are worth %s" % side_pot_values,
+                          get_current_bets(players),
+                          bet, current_player.current_bet, current_player.stack,
                           "(C)heck" if bet == current_player.current_bet else "(C)all"))
         # raise
         if response.lower() == "r":
@@ -209,6 +294,7 @@ def get_player_action(bet, min_bet, pot, players, current_player):
                 elif (player_bet >= min_bet) and (player_bet < (current_player.stack + current_player.current_bet)):
                     current_player.stack = current_player.stack - (player_bet - current_player.current_bet)
                     current_player.current_bet = player_bet
+                    current_player.hand_total_invested += player_bet
                     min_bet = 2 * player_bet - bet
                     bet = player_bet
 
@@ -222,6 +308,7 @@ def get_player_action(bet, min_bet, pot, players, current_player):
                 # all in
                 elif player_bet == current_player.stack:
                     current_player.current_bet = player_bet
+                    current_player.hand_total_invested += player_bet
                     current_player.stack = 0
                     bet = player_bet
                     current_player.all_in = True
@@ -243,9 +330,13 @@ def get_player_action(bet, min_bet, pot, players, current_player):
                 print("You called for %s chips" % bet)
                 current_player.stack = current_player.stack - (bet - current_player.current_bet)
                 current_player.current_bet = bet
+                current_player.hand_total_invested += (bet - current_player.current_bet)
+
             else:
+                # all in call
                 print("You've called and gone all in!")
                 current_player.current_bet = current_player.current_bet + current_player.stack
+                current_player.hand_total_invested += current_player.stack
                 current_player.stack = 0
                 current_player.all_in = True
             if current_player.big_blind:
@@ -262,8 +353,10 @@ def get_player_action(bet, min_bet, pot, players, current_player):
             # all in for greater than current bet
             if current_player.current_bet + current_player.stack > bet:
                 bet = current_player.current_bet + current_player.stack
+                current_player.last_bettor = True
 
             current_player.current_bet = current_player.stack + current_player.current_bet
+            current_player.hand_total_invested += current_player.stack
             current_player.stack = 0
             current_player.all_in = True
             print("%s is now all in! They've bet %s chips." % (current_player.name, current_player.current_bet))
@@ -286,6 +379,8 @@ def main():
     for name in player_names:
         players.append(Player(name, stack_size))
 
+    total_chips = len(players) * stack_size
+
     for player in players:
         print(player)
     print("\n")
@@ -295,20 +390,26 @@ def main():
     dealer = game_players[0]
     while playing_game:
         play_hand(game_players, big_blind, dealer)
-        reset_players(game_players)
-        for player in players:
-            if player.stack == stack_size * len(players):
-                playing_game = False
-                print("Game over! %s Wins!" % player.name)
-            elif player.stack == 0:
-                game_players.remove(player)
-                print("%s has busted!" % player.name)
-        if not playing_game:
-            break
         print("Hand over! The standings so far:")
         for player in players:
             print(player)
-        dealer = game_players[(game_players.index(dealer) - 1) % len(game_players)]
+        dealer_busted = False
+        for player in game_players:
+            if player.stack == total_chips:
+                playing_game = False
+                print("Game over! %s Wins!" % player.name)
+                break
+            elif player.stack == 0:
+                if dealer is player:
+                    dealer = get_next_player(game_players, dealer)
+                    print("dealer busted")
+                    dealer_busted = True
+                game_players.remove(player)
+                print("%s has busted!" % player.name)
+        if not dealer_busted:
+            dealer = get_next_player(game_players, dealer)
+
+        reset_players(game_players)
 
 
 if __name__ == "__main__":
